@@ -18,6 +18,7 @@ import {
 import type { ModelRuntimeProfile } from '@shared/providers/modelRuntimeProfiles';
 
 import type { EnterpriseAccountContext } from '../../shared/enterpriseAccount/types';
+import { parseModelPresetId, parseModelPresetPreference } from '../../shared/modelPresets/constants';
 import {
   applyEnterpriseAccountContext,
   refreshEnterpriseAccountContext,
@@ -43,8 +44,12 @@ import { clearMediaAccountState } from '../store/slices/coworkSlice';
 import type { Model } from '../store/slices/modelSlice';
 import {
   clearServerModels,
+  ServerModelLoadStatus,
+  setSelectedModel,
+  setServerModelLoadStatus,
   setServerModels,
 } from '../store/slices/modelSlice';
+import { AuthRecovery } from './authRecovery';
 import { i18nService } from './i18n';
 import { LogReporterAction, reportYdAnalyzer } from './logReporter';
 import { getCreditQuotaSnapshot } from './lowCreditPurchaseOffer';
@@ -83,6 +88,12 @@ export interface PricingCatalogBaseModel {
 }
 
 export interface PricingCatalogTextModel extends PricingCatalogBaseModel {
+  limitedFree?: boolean;
+  limitedFreeActive?: boolean;
+  limitedFreeStartAt?: string | null;
+  limitedFreeEndAt?: string | null;
+  subscriptionPriority?: boolean;
+  busy?: boolean;
   supportsImage?: boolean;
   supportsThinking?: boolean;
   thinkingConfig?: ModelThinkingConfig;
@@ -108,6 +119,7 @@ export interface PricingCatalogResponse {
 
 export interface AvailableServerModelEntry {
   modelId: string;
+  presetId?: unknown;
   modelName: string;
   provider: string;
   apiFormat: string;
@@ -127,6 +139,12 @@ export interface AvailableServerModelEntry {
   moreModel?: boolean;
   accessible?: boolean;
   restrictionHint?: string;
+  limitedFree?: boolean;
+  limitedFreeActive?: boolean;
+  limitedFreeStartAt?: string | null;
+  limitedFreeEndAt?: string | null;
+  subscriptionPriority?: boolean;
+  busy?: boolean;
 }
 
 const readString = (value: unknown): string => (
@@ -210,7 +228,7 @@ export function mapPricingCatalogTextModelsToServerModels(
       || readString(model.provider)
       || 'LobsterAI';
     const contextWindow = readPositiveNumber(model.contextWindow);
-    const costMultiplier = readPositiveNumber(model.costMultiplier);
+    const costMultiplier = model.limitedFreeActive ? 0 : readPositiveNumber(model.costMultiplier);
     const thinkingConfig = model.supportsThinking === true
       ? parseModelThinkingConfig(model.thinkingConfig)
       : undefined;
@@ -227,6 +245,12 @@ export function mapPricingCatalogTextModelsToServerModels(
       description: readString(model.description) || undefined,
       costMultiplier,
       contextWindow,
+      limitedFree: model.limitedFree,
+      limitedFreeActive: model.limitedFreeActive,
+      limitedFreeStartAt: model.limitedFreeStartAt,
+      limitedFreeEndAt: model.limitedFreeEndAt,
+      subscriptionPriority: model.subscriptionPriority,
+      busy: model.busy === true,
       moreModel: model.moreModel === true,
       accessible: false,
     }];
@@ -251,6 +275,7 @@ export function mapAvailableServerModelsToModels(
     const requestCapabilities = parseLobsterAIRequestCapabilities(model.requestCapabilities);
     return {
       id: model.modelId,
+      presetId: parseModelPresetId(model.presetId) ?? undefined,
       name: model.modelName,
       provider: model.provider,
       providerKey: ProviderName.LobsteraiServer,
@@ -269,8 +294,14 @@ export function mapAvailableServerModelsToModels(
       explicitContextCache: model.explicitContextCache ?? false,
       description: model.description,
       costMultiplier: model.costMultiplier,
+      limitedFree: model.limitedFree,
+      limitedFreeActive: model.limitedFreeActive,
+      limitedFreeStartAt: model.limitedFreeStartAt,
+      limitedFreeEndAt: model.limitedFreeEndAt,
+      subscriptionPriority: model.subscriptionPriority,
+      busy: model.busy === true,
       moreModel: model.moreModel === true,
-      accessible: model.accessible ?? true,
+      accessible: model.busy !== true && (model.accessible ?? true),
       restrictionHint: model.restrictionHint ?? undefined,
     };
   });
@@ -291,6 +322,29 @@ const ServerModelLoadOutcome = {
 type ServerModelLoadOutcome = typeof ServerModelLoadOutcome[keyof typeof ServerModelLoadOutcome];
 
 class AuthService {
+  private authRestoreGeneration = 0;
+  private pendingAuthRestore: {
+    requestSnapshot: AuthAccountRequestSnapshot;
+    promise: Promise<AuthStateRefreshResult>;
+  } | null = null;
+  private readonly recovery = new AuthRecovery({
+    recover: async () => {
+      const generation = this.authRestoreGeneration;
+      // An online signal can arrive before the offline startup request settles.
+      // Re-evaluate its result, then issue a fresh request if it failed.
+      await this.pendingAuthRestore?.promise;
+      if (generation !== this.authRestoreGeneration) return;
+      if (this.needsAuthRestore()) {
+        await this.refreshAuthState({ clearOnFailure: true });
+      } else if (store.getState().auth.isLoggedIn) {
+        await this.checkQuota();
+      } else {
+        await this.loadPublicPricingCatalogModels();
+      }
+    },
+    shouldRetry: () => this.needsAuthRestore(),
+    onError: error => writeAuthRendererLog('warn', 'account recovery failed', error),
+  });
   private unsubCallback: (() => void) | null = null;
   private unsubLifecycleEvent: (() => void) | null = null;
   private unsubQuotaChanged: (() => void) | null = null;
@@ -374,6 +428,7 @@ class AuthService {
   }
 
   private clearAuthenticatedAccountState(): void {
+    this.cancelAuthRecovery();
     this.clearEnterpriseQuotaBoundaryTimer();
     clearPendingPublishingConversionAttribution();
     observePublishingSubscriptionRecoveryAuthSnapshot({
@@ -434,15 +489,20 @@ class AuthService {
         outcome: AuthSessionStatus.TemporarilyUnavailable,
       });
       void this.loadPublicPricingCatalogModels();
+      this.recovery.schedule();
     }
 
     // Listen for quota changes (e.g. after cowork session using server model)
     this.unsubQuotaChanged = window.electron.auth.onQuotaChanged(() => {
-      void this.checkQuota();
+      void this.recoverAccount();
     });
 
     // Refresh quota and models when Electron window gains focus — user may have purchased on portal
     this.unsubWindowState = window.electron.window.onStateChanged((state) => {
+      if (state.isFocused && this.needsAuthRestore()) {
+        void this.recoverAccount();
+        return;
+      }
       if (state.isFocused && store.getState().auth.isLoggedIn) {
         const now = Date.now();
         const forcePublishingRecoveryRefresh =
@@ -461,7 +521,7 @@ class AuthService {
           || now - this.lastRefreshTime > 30_000
         ) {
           this.lastRefreshTime = now;
-          void this.checkQuota();
+          void this.recoverAccount();
         }
       } else if (
         state.isFocused
@@ -472,7 +532,7 @@ class AuthService {
         const now = Date.now();
         if (now - this.lastRefreshTime > 30_000) {
           this.lastRefreshTime = now;
-          void this.loadPublicPricingCatalogModels();
+          void this.recoverAccount();
         }
       }
     });
@@ -537,6 +597,7 @@ class AuthService {
       const result = await window.electron.auth.exchange(code);
       if (result.success && result.user) {
         writeAuthRendererLog('info', 'login callback exchange succeeded');
+        this.cancelAuthRecovery();
         store.dispatch(invalidateAuthAccountContext());
         store.dispatch(clearMediaAccountState());
         this.applyAuthenticatedState(
@@ -566,9 +627,30 @@ class AuthService {
     } = {},
   ): Promise<AuthStateRefreshResult> {
     const authStateAtStart = store.getState().auth;
+    if (
+      this.pendingAuthRestore
+      && isAuthAccountRequestCurrent(this.pendingAuthRestore.requestSnapshot, authStateAtStart)
+    ) {
+      return this.pendingAuthRestore.promise;
+    }
+    const generation = this.authRestoreGeneration;
+    const isCurrent = () => generation === this.authRestoreGeneration
+      && isAuthAccountRequestCurrent(authStateAtStart, store.getState().auth);
+    const promise = this.performAuthStateRefresh(options, isCurrent).finally(() => {
+      if (this.pendingAuthRestore?.promise === promise) this.pendingAuthRestore = null;
+      if (generation === this.authRestoreGeneration) this.recovery.schedule();
+    });
+    this.pendingAuthRestore = { requestSnapshot: authStateAtStart, promise };
+    return promise;
+  }
+
+  private async performAuthStateRefresh(
+    options: { clearOnFailure?: boolean; reportLifecycle?: boolean },
+    isCurrent: () => boolean,
+  ): Promise<AuthStateRefreshResult> {
     try {
       const result = await window.electron.auth.getUser();
-      if (!isAuthAccountRequestCurrent(authStateAtStart, store.getState().auth)) {
+      if (!isCurrent()) {
         writeAuthRendererLog(
           'debug',
           'discarded stale auth restoration response after auth state changed',
@@ -584,12 +666,10 @@ class AuthService {
       if (result.success && result.user) {
         const enterpriseContext = result.enterpriseContext === undefined
           ? await refreshEnterpriseAccountContext({
-            shouldApply: () => (
-              isAuthAccountRequestCurrent(authStateAtStart, store.getState().auth)
-            ),
+            shouldApply: isCurrent,
           })
           : result.enterpriseContext;
-        if (!isAuthAccountRequestCurrent(authStateAtStart, store.getState().auth)) {
+        if (!isCurrent()) {
           writeAuthRendererLog(
             'debug',
             'discarded stale auth restoration response after enterprise context refresh',
@@ -642,15 +722,17 @@ class AuthService {
         await this.applyLoggedOutState(false);
       }
     } catch {
-      store.dispatch(setAuthTemporarilyUnavailable({
-        hasCredentials: store.getState().auth.isLoggedIn,
-      }));
-      void this.loadPublicPricingCatalogModels();
-      if (options.reportLifecycle) {
-        reportAuthLifecycleEvent({
-          eventType: AuthLifecycleEventType.Restore,
-          outcome: AuthSessionStatus.TemporarilyUnavailable,
-        });
+      if (isCurrent()) {
+        store.dispatch(setAuthTemporarilyUnavailable({
+          hasCredentials: store.getState().auth.isLoggedIn,
+        }));
+        void this.loadPublicPricingCatalogModels();
+        if (options.reportLifecycle) {
+          reportAuthLifecycleEvent({
+            eventType: AuthLifecycleEventType.Restore,
+            outcome: AuthSessionStatus.TemporarilyUnavailable,
+          });
+        }
       }
     }
 
@@ -667,6 +749,7 @@ class AuthService {
    * Logout.
    */
   async logout() {
+    this.cancelAuthRecovery();
     clearPendingPublishingConversionAttribution();
     await window.electron.auth.logout();
     await this.applyLoggedOutState(false);
@@ -873,6 +956,7 @@ class AuthService {
   }
 
   destroy() {
+    this.cancelAuthRecovery();
     this.pendingQuotaCheck = null;
     this.pendingServerModelLoad = null;
     this.serverModelLoadSequence += 1;
@@ -891,8 +975,20 @@ class AuthService {
     this.unsubWindowState = null;
   }
 
-  private async handleSessionChanged(event: AuthSessionChangedEvent): Promise<void> {
-    if (event.status !== AuthSessionStatus.Expired) return;
+  /** Sync secondary windows without registering another OAuth callback consumer. */
+  async handleSessionChanged(event: AuthSessionChangedEvent): Promise<void> {
+    if (event.status === AuthSessionStatus.TemporarilyUnavailable) return;
+    this.cancelAuthRecovery();
+    // Invalidate pending reads even when this window still appears signed out.
+    store.dispatch(invalidateAuthAccountContext());
+    if (event.status === AuthSessionStatus.Authenticated) {
+      await this.refreshAuthState({ clearOnFailure: true });
+      return;
+    }
+    if (event.status === AuthSessionStatus.Unauthenticated) {
+      await this.applyLoggedOutState(false);
+      return;
+    }
     writeAuthRendererLog('warn', `login session expired (${event.reason})`);
     const cleanup = this.applyLoggedOutState(true);
     const toastKey = event.reason === AuthSessionChangeReason.EnterpriseMembershipRevoked
@@ -905,6 +1001,7 @@ class AuthService {
   }
 
   private async applyLoggedOutState(expired: boolean): Promise<void> {
+    this.cancelAuthRecovery();
     clearPendingPublishingConversionAttribution();
     observePublishingSubscriptionRecoveryAuthSnapshot({
       ownerAccountKey: null,
@@ -981,6 +1078,25 @@ class AuthService {
       this.enterpriseQuotaBoundaryTimer = setTimeout(fire, remaining);
     };
     arm();
+  }
+
+  /**
+   * Recover account data after connectivity changes or an explicit retry.
+   */
+  recoverAccount(): Promise<void> {
+    return this.recovery.request();
+  }
+
+  private needsAuthRestore(): boolean {
+    const auth = store.getState().auth;
+    return auth.sessionStatus === AuthSessionStatus.TemporarilyUnavailable
+      || (auth.isLoggedIn && (!auth.ownerAccountKey || !auth.user));
+  }
+
+  private cancelAuthRecovery(): void {
+    this.authRestoreGeneration += 1;
+    this.pendingAuthRestore = null;
+    this.recovery.cancel();
   }
 
   /**
@@ -1069,9 +1185,22 @@ class AuthService {
     const totalAttempts = SERVER_MODEL_LOAD_RETRY_DELAYS_MS.length + 1;
     const loadName = requestSnapshot.isLoggedIn ? 'server model load' : 'public catalog model load';
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      store.dispatch(setServerModelLoadStatus(ServerModelLoadStatus.Loading));
       const outcome = requestSnapshot.isLoggedIn
         ? await this.requestServerModels(requestSnapshot)
         : await this.requestPublicPricingCatalogModels(requestSnapshot);
+      // A failed request from a previous account must not overwrite the new
+      // account's loading state (including failures thrown before a response).
+      if (
+        this.serverModelLoadSequence !== loadSequence
+        || !isAuthAccountRequestCurrent(requestSnapshot, store.getState().auth)
+      ) {
+        settleFirstAttempt(false);
+        return;
+      }
+      if (outcome === ServerModelLoadOutcome.Retryable) {
+        store.dispatch(setServerModelLoadStatus(ServerModelLoadStatus.Error));
+      }
       if (attempt === 1) {
         settleFirstAttempt(outcome === ServerModelLoadOutcome.Loaded);
       }
@@ -1104,14 +1233,26 @@ class AuthService {
     requestSnapshot: AuthAccountRequestSnapshot,
   ): Promise<ServerModelLoadOutcome> {
     try {
-      const modelsResult = await window.electron.auth.getModels();
+      const [modelsResult, preferences] = await Promise.all([
+        window.electron.auth.getModels(),
+        window.electron.modelPresets?.getPreferences().catch(() => ({ success: false, data: {} })),
+      ]);
       if (!isAuthAccountRequestCurrent(requestSnapshot, store.getState().auth)) {
         writeAuthRendererLog('debug', 'discarded stale server model response after auth state changed');
         return ServerModelLoadOutcome.Abandoned;
       }
       if (modelsResult.success && Array.isArray(modelsResult.models)) {
         const serverModels = mapAvailableServerModelsToModels(modelsResult.models);
+        const presetModels = serverModels.filter(model => model.presetId);
         store.dispatch(setServerModels(serverModels));
+        if (preferences?.success) {
+          for (const [agentId, rawPreference] of Object.entries(preferences.data ?? {})) {
+            const preference = parseModelPresetPreference(rawPreference);
+            if (!preference) continue;
+            const model = presetModels.find(item => item.presetId === preference.presetId && item.accessible !== false);
+            if (model) store.dispatch(setSelectedModel({ agentId, model: { ...model, presetThinkingLevel: preference.thinkingLevel } }));
+          }
+        }
         writeAuthRendererLog(
           'debug',
           `loaded ${serverModels.length} server model(s) into renderer state`,

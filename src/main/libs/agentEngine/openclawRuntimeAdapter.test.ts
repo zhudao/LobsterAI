@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import { expect, test, vi } from 'vitest';
 
+import { MediaGenerationTool } from '../../mediaGenerationPolicy';
+
 vi.mock('electron', () => ({
   app: {
     getAppPath: () => process.cwd(),
@@ -20,6 +22,7 @@ import {
   ContextCompactionStatus,
   CoworkSystemMessageKind,
 } from '../../../common/coworkSystemMessages';
+import { buildScheduledTaskEnginePrompt } from '../../../scheduledTask/enginePrompt';
 import {
   BrowserControlRequestMethod,
   OpenClawBrowserGatewayMethod,
@@ -37,6 +40,8 @@ import { CoworkErrorModelSource } from '../../../shared/cowork/errorDetail';
 import { OpenClawCronRunMetadataKey } from '../../../shared/cowork/openclawCronSessionKey';
 import { CoworkSelectedTextSource } from '../../../shared/cowork/selectedText';
 import { CoworkSteerRejectReason, CoworkSteerStatus } from '../../../shared/cowork/steer';
+import { imageEditRegionPrompt } from '../../../shared/imageEditing/prompts';
+import { ImageEditOperation, type ImageEditRequest } from '../../../shared/imageEditing/types';
 import { OpenClawTranscriptSafetyLimit } from '../../../shared/openclawTranscript/constants';
 import { ProviderName } from '../../../shared/providers/constants';
 import { setLanguage, t } from '../../i18n';
@@ -2943,6 +2948,51 @@ test('sessions.changed drives IM loading status without creating a local active 
   ]);
 });
 
+test('sessions.changed end settles an IM run without a local turn after syncing its history', async () => {
+  const sessionKey = 'agent:main:openclaw-weixin:bot-1:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const calls: string[] = [];
+  const onChannelRunEnded = vi.fn((sessionId: string, runId: string, startedAt?: number) => {
+    calls.push(`ended:${sessionId}:${runId}:${startedAt}`);
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelRunEnded });
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (method: string) => {
+      calls.push(method);
+      return { messages: [] };
+    },
+  };
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => true,
+    resolveOrCreateSession: () => session.id,
+  };
+
+  adapter.handleGatewayEvent({
+    event: 'sessions.changed',
+    payload: { sessionKey, runId: 'im-run-1', phase: 'start', status: 'running', ts: 1_000 },
+  });
+  adapter.handleGatewayEvent({
+    event: 'sessions.changed',
+    payload: { sessionKey, runId: 'im-run-1', phase: 'end', status: 'done', ts: 2_000 },
+  });
+
+  await vi.waitFor(() => expect(onChannelRunEnded).toHaveBeenCalledOnce());
+  expect(calls).toEqual(['chat.history', `ended:${session.id}:im-run-1:1000`]);
+
+  // A run followed by a local turn settles through `complete` instead.
+  adapter.activeTurns.set(session.id, createActiveTurn(session.id, sessionKey, 'im-run-2'));
+  adapter.handleGatewayEvent({
+    event: 'sessions.changed',
+    payload: { sessionKey, runId: 'im-run-2', phase: 'end', status: 'done' },
+  });
+  await Promise.resolve();
+  expect(onChannelRunEnded).toHaveBeenCalledOnce();
+});
+
 test('sessions.changed start reports an IM prompt once across lifecycle and ActiveTurn paths', () => {
   const sessionKey = 'agent:main:openclaw-weixin:bot-1:direct:user-1';
   const { session, store } = createReconcileStore([], {
@@ -2979,7 +3029,7 @@ test('sessions.changed start reports an IM prompt once across lifecycle and Acti
     conversationState: 'new_task',
     isMainAgent: true,
     platform: 'weixin',
-  });
+  }, session.id);
   expect(observedStatuses).toEqual(['running']);
   expect(adapter.activeTurns.has(session.id)).toBe(false);
 
@@ -3081,7 +3131,7 @@ test('IM prompt submit analytics reports each channel run once with routing cont
     conversationState: 'new_task',
     isMainAgent: false,
     platform: 'feishu',
-  });
+  }, session.id);
 
   session.messages.push({
     id: 'assistant-1',
@@ -3098,7 +3148,7 @@ test('IM prompt submit analytics reports each channel run once with routing cont
     conversationState: 'continue_session',
     isMainAgent: false,
     platform: 'feishu',
-  });
+  }, session.id);
 });
 
 test('IM prompt submit analytics keeps its run deduplication memory bounded', () => {
@@ -3396,6 +3446,7 @@ function createRunTurnAdapter(options: {
   autoFinalizeChatSend?: boolean;
   holdChatSend?: boolean;
   stateDir?: string;
+  defaultSystemPrompt?: string;
 } = {}) {
   const session = {
     id: 'session-1',
@@ -3430,6 +3481,10 @@ function createRunTurnAdapter(options: {
   }> = [];
   const store = {
     getSession: (sessionId: string) => (sessionId === session.id ? session : null),
+    getLatestUserMessage: (sessionId: string) => {
+      expect(sessionId).toBe(session.id);
+      return session.messages.findLast(message => message.type === 'user') ?? null;
+    },
     updateSession: (sessionId: string, patch: Record<string, unknown>) => {
       expect(sessionId).toBe(session.id);
       Object.assign(session, patch);
@@ -3461,6 +3516,9 @@ function createRunTurnAdapter(options: {
       }
       : null),
     updateAgent: () => {},
+    ...(options.defaultSystemPrompt !== undefined
+      ? { getConfig: () => ({ systemPrompt: options.defaultSystemPrompt }) }
+      : {}),
   };
   const engineManager = {
     startGateway: async () => ({ phase: 'running', message: '' }),
@@ -4039,6 +4097,53 @@ test('a turn stores one W3C trace on its user message and sends it with chat.sen
   });
 });
 
+test('a comment turn persists its regions and sends their coordinates to the conversation model', async () => {
+  const { adapter, requests, session } = createRunTurnAdapter();
+  const imageEdit: ImageEditRequest = {
+    id: 'edit-1', sourceVersionNumber: 10, operation: ImageEditOperation.Comment, createdAt: 2,
+    source: { id: 'v10', rootId: 'v1', sessionId: 'session-1', filePath: '/private/edit-1.png',
+      title: 'cup.png', width: 2048, height: 1024, createdAt: 1, operation: ImageEditOperation.Comment },
+    regions: [{ id: 'r1', x: 0.1, y: 0.2, width: 0.3, height: 0.4, text: 'Add a dog here' }],
+  };
+  await adapter.continueSession('session-1', '@图片1 按选区修改', {
+    mediaReferences: [{ token: '@图片1', mediaType: 'image', index: 1, fileName: 'cup.png', mimeType: 'image/png',
+      localPath: imageEdit.source.filePath, imageEdit }],
+  });
+  const userMessage = session.messages.find(message => message.type === 'user');
+  expect(userMessage?.metadata).toMatchObject({ imageEdits: [{
+    requestId: 'edit-1', sourceVersionNumber: 10, source: { width: 2048, height: 1024 },
+    regions: [{ id: 'r1', x: 0.1, y: 0.2, width: 0.3, height: 0.4, text: 'Add a dog here' }],
+  }] });
+  const chatSend = requests.find(request => request.method === 'chat.send');
+  expect(chatSend?.params.message).toContain(`@图片1: ${imageEditRegionPrompt(imageEdit)}`);
+  expect(chatSend?.params.message).toContain('1. [10.0, 20.0, 30.0, 40.0]: Add a dog here');
+  expect(userMessage?.content).toBe('@图片1 按选区修改');
+});
+
+test('an erase turn explains the prepared mask and preserves long source paths for the conversation model', async () => {
+  const { adapter, requests, session } = createRunTurnAdapter();
+  const directory = `D:/profile/image-editing/${'a'.repeat(64)}/${'long-directory/'.repeat(10)}`;
+  const imageEdit: ImageEditRequest = {
+    id: 'erase-1', sourceVersionNumber: 15, operation: ImageEditOperation.Erase, createdAt: 2,
+    source: { id: 'v15', rootId: 'v1', sessionId: 'session-1', filePath: `${directory}erase-1-source.png`,
+      title: 'cup.png', width: 2048, height: 1024, createdAt: 1, operation: ImageEditOperation.Comment },
+    guidePath: `${directory}erase-1-guide.png`, regions: [],
+  };
+  await adapter.continueSession('session-1', '@图片1 消除涂抹区域', {
+    mediaReferences: [{ token: '@图片1', mediaType: 'image', index: 1, fileName: 'cup.png', mimeType: 'image/png',
+      localPath: imageEdit.source.filePath, imageEdit }],
+  });
+  const chatSend = requests.find(request => request.method === 'chat.send');
+  expect(chatSend?.params.message).toContain(`localPath "${imageEdit.source.filePath}"`);
+  expect(chatSend?.params.message).toContain(imageEdit.guidePath);
+  expect(chatSend?.params.message).toContain('2048 x 1024 removal mask');
+  expect(chatSend?.params.message).toContain('WHITE marks the removal area; BLACK marks the area to preserve');
+  expect(chatSend?.params.message).toContain('source FIRST and this mask SECOND');
+  expect(session.messages.find(message => message.type === 'user')?.metadata).toMatchObject({
+    imageEdits: [{ requestId: 'erase-1', sourceVersionNumber: 15, operation: ImageEditOperation.Erase }],
+  });
+});
+
 test('runs for a user message stored before the turn share the trace on that message', async () => {
   const { adapter, requests, session } = createRunTurnAdapter();
   session.messages.push({
@@ -4078,6 +4183,85 @@ test('normal conversation does not receive plan mode instructions', async () => 
   expect(chatSendRequests[0].params.message).not.toContain('# Plan Mode');
   expect(chatSendRequests[0].params.message).not.toContain('[Plan Mode reminder]');
   expect(chatSendRequests[0].params.message).not.toContain('[Plan Mode recovery instruction]');
+});
+
+const withAgentsMdStateDir = async (
+  agentsMdBody: string,
+  run: (stateDir: string) => Promise<void>,
+): Promise<void> => {
+  const stateDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lobsterai-system-prompt-dedup-')));
+  try {
+    fs.mkdirSync(path.join(stateDir, 'workspace-main'), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, 'workspace-main', 'AGENTS.md'),
+      `# AGENTS.md\n\n<!-- LobsterAI managed: do not edit below this line -->\n\n${agentsMdBody}\n`,
+      'utf8',
+    );
+    await run(stateDir);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+};
+
+test('system prompt injection skips sections that AGENTS.md already delivers', async () => {
+  const defaultSystemPrompt = '# Style\n- Keep replies concise and direct.';
+  const scheduledTaskPrompt = buildScheduledTaskEnginePrompt();
+  await withAgentsMdStateDir(
+    `## System Prompt\n\n${defaultSystemPrompt}\n\n${scheduledTaskPrompt}`,
+    async (stateDir) => {
+      const { adapter, requests } = createRunTurnAdapter({ stateDir, defaultSystemPrompt });
+
+      await adapter.continueSession('session-1', 'Summarize this folder', {
+        systemPrompt: [scheduledTaskPrompt, '## Selected skills\n- Use the docx skill.', defaultSystemPrompt].join('\n\n'),
+      });
+
+      const message = requests.find((request) => request.method === 'chat.send')?.params.message;
+      expect(message).toContain('[LobsterAI system instructions]');
+      expect(message).toContain('- Use the docx skill.');
+      expect(message).not.toContain('Keep replies concise and direct.');
+      expect(message).not.toContain('## Scheduled Tasks');
+    },
+  );
+});
+
+test('system prompt injection replaces earlier instructions when AGENTS.md covers the whole prompt', async () => {
+  const defaultSystemPrompt = '# Style\n- Keep replies concise and direct.';
+  const scheduledTaskPrompt = buildScheduledTaskEnginePrompt();
+  await withAgentsMdStateDir(
+    `## System Prompt\n\n${defaultSystemPrompt}\n\n${scheduledTaskPrompt}`,
+    async (stateDir) => {
+      const { adapter, requests } = createRunTurnAdapter({ stateDir, defaultSystemPrompt });
+
+      await adapter.continueSession('session-1', 'Hello', {
+        systemPrompt: [scheduledTaskPrompt, defaultSystemPrompt].join('\n\n'),
+      });
+
+      const message = requests.find((request) => request.method === 'chat.send')?.params.message;
+      expect(message).toContain('If earlier LobsterAI system instructions exist, replace them with this version.');
+      expect(message).toContain('No session-specific instructions apply; follow the workspace instructions in AGENTS.md.');
+      expect(message).not.toContain('Keep replies concise and direct.');
+      expect(message).not.toContain('## Scheduled Tasks');
+    },
+  );
+});
+
+test('system prompt injection keeps AGENTS.md sections when OpenClaw would truncate the file', async () => {
+  const defaultSystemPrompt = '# Style\n- Keep replies concise and direct.';
+  const scheduledTaskPrompt = buildScheduledTaskEnginePrompt();
+  await withAgentsMdStateDir(
+    `${'Long user notes. '.repeat(1_500)}\n\n## System Prompt\n\n${defaultSystemPrompt}\n\n${scheduledTaskPrompt}`,
+    async (stateDir) => {
+      const { adapter, requests } = createRunTurnAdapter({ stateDir, defaultSystemPrompt });
+
+      await adapter.continueSession('session-1', 'Hello', {
+        systemPrompt: [scheduledTaskPrompt, defaultSystemPrompt].join('\n\n'),
+      });
+
+      const message = requests.find((request) => request.method === 'chat.send')?.params.message;
+      expect(message).toContain('Keep replies concise and direct.');
+      expect(message).toContain('## Scheduled Tasks');
+    },
+  );
 });
 
 test('annotation-only turn persists structured metadata and builds a trust-separated prompt', async () => {
@@ -6043,15 +6227,17 @@ test('chat error replaces generic LLM failure using safe OpenClaw metadata', () 
   ]);
   const adapter = new OpenClawRuntimeAdapter(store, {});
   const sessionKey = `agent:main:lobsterai:${session.id}`;
+  // Run IDs are opaque correlation keys; auth failures are represented by the metadata below.
+  const runId = 'b398b8c7-4e10-4018-a080-8094c142eec0';
   const errorSpy = vi.fn();
 
   session.status = 'running';
   adapter.on('error', errorSpy);
-  adapter.activeTurns.set(session.id, createActiveTurn(session.id, sessionKey, 'run-minimax-oauth'));
+  adapter.activeTurns.set(session.id, createActiveTurn(session.id, sessionKey, runId));
 
   adapter.handleChatEvent({
     state: 'error',
-    runId: 'run-minimax-oauth',
+    runId,
     sessionKey,
     errorMessage: 'LLM request failed.',
     provider: 'minimax-portal',
@@ -9951,7 +10137,7 @@ test('repeated blocked mutation in one plan turn stops instead of looping recove
   expect(session.status).toBe('idle');
 });
 
-test.each(['write_file', 'create_file', 'delete_file', 'powershell'])(
+test.each(['write_file', 'create_file', 'delete_file', 'powershell', MediaGenerationTool.Image, MediaGenerationTool.Video])(
   'plan mode blocks the mutating or opaque tool alias %s',
   async (toolName) => {
     const { session, store } = createReconcileStore([
@@ -10222,6 +10408,32 @@ test('reconcileWithHistory: preserves tool messages', async () => {
   await adapter.reconcileWithHistory(session.id, 'managed:session-1');
 
   expect(getReplaceCallCount()).toBe(0);
+});
+
+test('reconcileWithHistory: ignores old image diagnostics without rewriting local messages', async () => {
+  const originalReply = 'Image ready.\n[session:history] omitted image payload: missing data or mimeType';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Edit this image', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'tool_result', content: 'Image generated', timestamp: 2, metadata: {} },
+    { id: 'msg-3', type: 'assistant', content: originalReply, timestamp: 3, metadata: {} },
+  ]);
+  const originalMessages = structuredClone(session.messages);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      messages: [
+        { role: 'user', content: 'Edit this image' },
+        { role: 'assistant', content: 'Image ready.' },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'managed:session-1');
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages).toEqual(originalMessages);
 });
 
 test('reconcileWithHistory: gateway returns tail subset — preserves older local messages', async () => {

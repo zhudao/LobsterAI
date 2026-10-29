@@ -3,13 +3,16 @@ import { app, BrowserWindow } from 'electron';
 import path from 'path';
 
 import { ASK_USER_QUESTION_TOOL_NAME, SESSION_AGNOSTIC_PERMISSION_SESSION_ID } from '../../shared/cowork/constants';
+import { McpAuthMode } from '../../shared/mcp/auth';
 import { McpIpcChannel } from '../../shared/mcp/constants';
 import type { McpToolDiscoveryRequest } from '../../shared/mcp/toolDiscovery';
+import { type MediaConfirmationCommand, MediaConfirmationReason } from '../../shared/media/confirmation';
 import { isComputerUseKitInstalled, syncComputerUseSkillFromRuntime } from '../computerUse/computerUseKit';
 import { resolveComputerUseMcpServer } from '../computerUse/computerUseMcpServer';
 import { installComputerUseRuntime } from '../computerUse/computerUseRuntime';
 import { ensureElectronNodeShim, getElectronNodeRuntimePath } from '../libs/coworkUtil';
 import {
+  type AskUserOptions,
   type AskUserRequest,
   type AskUserResponse,
   type BrowserToolRequest,
@@ -20,9 +23,11 @@ import {
   type MediaGenerationRequest,
   type MediaGenerationResponse,
 } from '../libs/mcpBridgeServer';
+import { applyNodeSystemCaDefault } from '../libs/nodeSystemCaEnv';
 import { OpenClawConfigImpact } from '../libs/openclawConfigImpact';
 import type { ResolvedMcpServer } from '../libs/openclawConfigSync';
 import { resolveLocalDesktopCoworkSessionIdByOpenClawSessionKey } from '../libs/openclawLocalSessionResolver';
+import { applyPythonEncodingDefaults } from '../libs/pythonEncodingEnv';
 import { appendPythonRuntimeToEnv } from '../libs/pythonRuntime';
 import { resolveStdioCommand } from '../libs/resolveStdioCommand';
 import type { SqliteStore } from '../sqliteStore';
@@ -37,15 +42,20 @@ const getPackagedNpmBinDir = (): string => (app.isPackaged
   ? path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'npm', 'bin')
   : '');
 
-/** Env the node/npx shims need; MCP children only inherit a short allowlist. */
-function buildMcpShimEnv(): Record<string, string> {
-  const shimEnv: Record<string, string> = {
+/** Runtime env omitted by the MCP inheritance allowlist; server overrides win. */
+function buildMcpShimEnv(...overrides: (Record<string, string> | undefined)[]): Record<string, string> {
+  let shimEnv: Record<string, string> = {
     LOBSTERAI_ELECTRON_PATH: getElectronNodeRuntimePath(),
   };
   const npmBinDir = getPackagedNpmBinDir();
   if (npmBinDir) {
     shimEnv.LOBSTERAI_NPM_BIN_DIR = npmBinDir;
   }
+  for (const override of overrides) {
+    shimEnv = { ...shimEnv, ...override };
+  }
+  applyPythonEncodingDefaults(shimEnv, { sources: [process.env, ...overrides] });
+  applyNodeSystemCaDefault(shimEnv);
   return shimEnv;
 }
 
@@ -213,6 +223,7 @@ export class McpRuntime {
         return;
       }
       const windows = BrowserWindow.getAllWindows();
+      let delivered = false;
       windows.forEach(win => {
         if (win.isDestroyed()) return;
         try {
@@ -223,15 +234,21 @@ export class McpRuntime {
               toolName: ASK_USER_QUESTION_TOOL_NAME,
               toolInput: {
                 questions: request.questions,
+                ...(request.mediaConfirmation ? { mediaConfirmation: request.mediaConfirmation } : {}),
                 ...(request.sessionKey ? { sessionKey: request.sessionKey } : {}),
               },
             },
           });
+          delivered = true;
         } catch (error) {
           console.error('[AskUser] failed to send permission request to window:', error);
         }
       });
-      this.deps.onAskUserRequested?.(sessionId, {
+      if (request.mediaConfirmation && !delivered) {
+        this.resolveAskUser(request.requestId, { behavior: 'deny', reason: MediaConfirmationReason.NoRoute });
+        return;
+      }
+      if (!request.mediaConfirmation || request.mediaConfirmation.sequence === 1) this.deps.onAskUserRequested?.(sessionId, {
         requestId: request.requestId,
         toolName: ASK_USER_QUESTION_TOOL_NAME,
       });
@@ -281,10 +298,25 @@ export class McpRuntime {
   async askUserInternal(
     questions: AskUserRequest['questions'],
     timeoutMs?: number,
-    options?: { sessionKey?: string },
+    options?: AskUserOptions,
   ): Promise<AskUserResponse | null> {
     if (!this.bridgeServer) return null;
     return await this.bridgeServer.askUserInternal(questions, timeoutMs, options);
+  }
+
+  getPendingMediaConfirmations() {
+    return (this.bridgeServer?.getPendingMediaConfirmations() ?? []).flatMap(request => {
+      const sessionId = request.sessionKey ? resolveLocalDesktopCoworkSessionIdByOpenClawSessionKey(
+        this.deps.getStore().getDatabase(), request.sessionKey,
+      ) : null;
+      if (!sessionId) { this.bridgeServer?.resolveAskUser(request.requestId, { behavior: 'deny' }); return []; }
+      return [{ sessionId, requestId: request.requestId, toolName: ASK_USER_QUESTION_TOOL_NAME,
+        toolInput: { questions: request.questions, mediaConfirmation: request.mediaConfirmation } }];
+    });
+  }
+
+  actOnMediaConfirmation(command: MediaConfirmationCommand): Promise<boolean> {
+    return this.bridgeServer?.actOnMediaConfirmation(command) ?? Promise.resolve(false);
   }
 
   resolveAskUser(requestId: string, response: AskUserResponse): void {
@@ -339,14 +371,14 @@ export class McpRuntime {
       launch = {
         command: readyResolution.command,
         args: readyResolution.args || [],
-        env: { ...buildMcpShimEnv(), ...(readyResolution.env || {}), ...(server.env || {}) },
+        env: buildMcpShimEnv(readyResolution.env, server.env),
       };
     } else {
       const resolvedCommand = await resolveStdioCommand(server);
       launch = {
         command: resolvedCommand.command,
         args: resolvedCommand.args,
-        env: { ...buildMcpShimEnv(), ...(resolvedCommand.env || {}) },
+        env: buildMcpShimEnv(resolvedCommand.env),
       };
     }
 
@@ -370,12 +402,14 @@ export class McpRuntime {
     let builtInCount = 0;
 
     const electronPath = getElectronNodeRuntimePath();
-    // toolFilter / supportsParallelToolCalls ride along to openclaw.json regardless of transport.
+    // toolFilter / supportsParallelToolCalls / timeouts ride along to openclaw.json regardless of transport.
     const passthroughFields = (server: typeof enabledServers[number]) => ({
       ...(server.toolFilter ? { toolFilter: server.toolFilter } : {}),
       ...(typeof server.supportsParallelToolCalls === 'boolean'
         ? { supportsParallelToolCalls: server.supportsParallelToolCalls }
         : {}),
+      ...(server.requestTimeoutMs ? { requestTimeoutMs: server.requestTimeoutMs } : {}),
+      ...(server.connectionTimeoutMs ? { connectionTimeoutMs: server.connectionTimeoutMs } : {}),
     });
     const pushRawStdioServer = async (server: typeof enabledServers[number]): Promise<void> => {
       const r = await resolveStdioCommand(server);
@@ -384,7 +418,7 @@ export class McpRuntime {
         transportType: 'stdio',
         command: r.command,
         args: r.args,
-        env: { ...buildMcpShimEnv(), ...(r.env || {}) },
+        env: buildMcpShimEnv(r.env),
         ...passthroughFields(server),
       });
     };
@@ -401,7 +435,7 @@ export class McpRuntime {
               transportType: 'stdio',
               command: readyResolution.command,
               args: readyResolution.args || [],
-              env: { ...buildMcpShimEnv(), ...(readyResolution.env || {}), ...(server.env || {}) },
+              env: buildMcpShimEnv(readyResolution.env, server.env),
               ...passthroughFields(server),
             });
             continue;
@@ -454,6 +488,7 @@ export class McpRuntime {
           transportType: server.transportType,
           url: server.url,
           headers: server.headers,
+          ...(server.auth === McpAuthMode.OAuth ? { auth: McpAuthMode.OAuth } : {}),
           ...passthroughFields(server),
         });
       }

@@ -25,6 +25,7 @@ import {
   type BrowserControlGatewayRequest,
   OpenClawBrowserGatewayMethod,
 } from '../../../shared/browserWebAccess/constants';
+import { stripAssistantImageDiagnostic } from '../../../shared/cowork/assistantImageDiagnostic';
 import {
   buildBrowserAnnotationPromptSection,
   type CoworkBrowserAnnotationMessageBatch,
@@ -83,6 +84,8 @@ import {
 } from '../../../shared/enterpriseAccount/constants';
 import { resolveEnterpriseQuotaError } from '../../../shared/enterpriseAccount/quotaError';
 import type { EnterpriseQuotaErrorDetails } from '../../../shared/enterpriseAccount/types';
+import { imageEditMessageMetadata } from '../../../shared/imageEditing/messageSnapshot';
+import { imageEditMaskContext, imageEditRegionPrompt } from '../../../shared/imageEditing/prompts';
 import type {
   KitReference,
   ResolvedKitCapabilities,
@@ -95,9 +98,11 @@ import { t } from '../../i18n';
 import { MediaGenerationTool } from '../../mediaGenerationPolicy';
 import type { SubagentMessageStore } from '../../subagentMessageStore';
 import type { SubagentRunStore } from '../../subagentRunStore';
-import { setCoworkProxySessionId } from '../coworkOpenAICompatProxy';
+import { getServerModelMetadata } from '../claudeSettings';
 import { getServerApiBaseUrl } from '../endpoints';
 import { createCoworkLlmTrace, createLlmTraceparent } from '../llmTrace';
+import { registerLlmUsageContext } from '../llmUsageContext';
+import { presetContextWindowSelection } from '../modelPresetContext';
 import { extractOpenClawAssistantStreamParts,extractOpenClawAssistantStreamText } from '../openclawAssistantText';
 import {
   buildManagedSessionKey,
@@ -131,7 +136,7 @@ import {
   stripTrailingSilentReplyToken,
 } from '../openclawHistory';
 import { buildOpenClawLocalTimeContextPrompt } from '../openclawLocalTimeContextPrompt';
-import { resolveOpenClawThinkingLevelForModel } from '../openclawModelThinkingLevels';
+import { resolveModelThinkingLevelForModel, resolveOpenClawThinkingLevelForModel } from '../openclawModelThinkingLevels';
 import { consumeRecentOpenClawTokenProxyQuotaError } from '../openclawTokenProxy';
 import { isSystemProxyEnabled } from '../systemProxy';
 import {
@@ -166,6 +171,7 @@ import { buildMediaGenerationTurnInstruction } from './mediaGenerationTurnInstru
 import { OpenClawApprovalController } from './openclawApprovalController';
 import {
   applyLocalTimestampsToEntries,
+  applyLocalTurnUsageToEntries,
   buildGatewayMediaMetadata,
   findTailAlignment,
   getLocalMediaAttachmentsKey,
@@ -239,6 +245,7 @@ import type {
   CoworkStartOptions,
   PermissionResult,
 } from './types';
+import { removeWorkspaceDeliveredInstructions } from './workspaceDeliveredInstructions';
 
 const OPENCLAW_GATEWAY_TOOL_EVENTS_CAP = 'tool-events';
 const OPENCLAW_BTW_SESSION_KEY_MAX_CHARS = 4_096;
@@ -502,6 +509,8 @@ type GatewayClientCtor = new (options: Record<string, unknown>) => GatewayClient
 type ChannelSessionLifecycleRun = {
   runId: string;
   observedAtMs: number;
+  /** OpenClaw's time for the run start; runs of a session do not overlap. */
+  startedAt?: number;
 };
 
 type OpenClawRuntimeAdapterOptions = {
@@ -511,7 +520,9 @@ type OpenClawRuntimeAdapterOptions = {
     conversationState: PromptAnalyticsConversationStateValue;
     isMainAgent: boolean;
     platform: string;
-  }) => void;
+  }, sessionId: string) => void;
+  /** An IM run that no local turn followed has ended and its messages are synced. */
+  onChannelRunEnded?: (sessionId: string, runId: string, runStartedAt?: number) => void;
   onGatewayClientReady?: () => void;
   onBrowserToolEvent?: (event: AgentBrowserToolEvent) => void;
 };
@@ -849,6 +860,8 @@ type ActiveTurn = {
 };
 
 const PLAN_MODE_BLOCKED_TOOL_NAMES = new Set([
+  MediaGenerationTool.Image,
+  MediaGenerationTool.Video,
   'apply_patch',
   'bash',
   'cmd',
@@ -1495,7 +1508,7 @@ const normalizeEntryText = (
   text: string,
   flags: PlatformFlags,
 ): string => {
-  let result = text.trim();
+  let result = (role === 'assistant' ? stripAssistantImageDiagnostic(text) : text).trim();
   if (!result) return result;
   if (flags.isDiscord) result = stripDiscordMentions(result);
   if (flags.isQQ && role === 'user') result = stripQQBotSystemPrompt(result);
@@ -2432,8 +2445,8 @@ const MediaReferenceTypeLabel = {
   Audio: 'audio',
 } as const;
 
-const sanitizeMediaReferenceText = (value: string): string => (
-  value.replace(/[\r\n]+/g, ' ').trim().slice(0, 200)
+const sanitizeMediaReferenceText = (value: string, maxLength = 200): string => (
+  value.replace(/[\r\n]+/g, ' ').trim().slice(0, maxLength)
 );
 
 const buildMediaReferencePromptSection = (mediaReferences?: CoworkMediaAttachmentRef[]): string => {
@@ -2448,14 +2461,20 @@ const buildMediaReferencePromptSection = (mediaReferences?: CoworkMediaAttachmen
   ];
 
   for (const ref of refs) {
+    if (ref.imageEdit) {
+      lines.push('This image has a user-prepared image editing request. Call lobsterai_image_generate once with action=generate. LobsterAI will supply the immutable original, selected regions and any guide/mask, and will save a new version. Do not edit it with scripts or other image tools. Include any additional user instructions in the prompt.');
+      const maskContext = imageEditMaskContext(ref.imageEdit);
+      if (maskContext) lines.push(maskContext);
+    }
+    if (ref.imageEdit?.regions.length) lines.push(`${ref.token}: ${imageEditRegionPrompt(ref.imageEdit)}`);
     const mediaType = ref.mediaType === MediaReferenceTypeLabel.Image
       ? MediaReferenceTypeLabel.Image
       : ref.mediaType === MediaReferenceTypeLabel.Video
         ? MediaReferenceTypeLabel.Video
         : MediaReferenceTypeLabel.Audio;
     const locations = [
-      ref.localPath ? `localPath "${sanitizeMediaReferenceText(ref.localPath)}"` : '',
-      ref.remoteUrl ? `remoteUrl "${sanitizeMediaReferenceText(ref.remoteUrl)}"` : '',
+      ref.localPath ? `localPath "${sanitizeMediaReferenceText(ref.localPath, 32768)}"` : '',
+      ref.remoteUrl ? `remoteUrl "${sanitizeMediaReferenceText(ref.remoteUrl, 32768)}"` : '',
       !ref.localPath && !ref.remoteUrl && ref.dataUrl ? 'dataUrl fallback available through LobsterAI host' : '',
     ].filter(Boolean);
     const locationText = locations.length > 0 ? `, ${locations.join(', ')}` : '';
@@ -4858,6 +4877,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         question: normalizedQuestion,
       });
       const btwTrace = createCoworkLlmTrace();
+      registerLlmUsageContext(btwTrace.traceId, normalizedSessionId, normalizedQuestion, {
+        modelPresetId: session.modelPresetId,
+        resolvedModelId: session.modelOverride?.split('/').slice(1).join('/'),
+      });
       console.log(
         '[CoworkBtw] submitting side question.',
         `Session ${normalizedSessionId}.`,
@@ -5239,6 +5262,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
   async patchSession(sessionId: string, patch: OpenClawSessionPatch): Promise<CoworkSessionPatchResult> {
     const session = this.store.getSession(sessionId);
+    if (patch.model !== undefined && session?.modelPresetId && (this.activeTurns.has(sessionId) || this.yieldedSessions.has(sessionId))) {
+      throw new Error(t('modelPresetSessionBusy'));
+    }
     if (!session) {
       throw new Error(`Session ${sessionId} not found`);
     }
@@ -5289,6 +5315,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           timeoutMs: OpenClawRuntimeAdapter.SESSION_PATCH_TIMEOUT_MS,
         });
         this.markGatewayRpcSuccess();
+        if (normalizedPatch.model) this.assertSessionModelRoute(sessionId, targetSessionKey, normalizedPatch.model, response);
         return response;
       } catch (error) {
         this.recordGatewayRpcFailure('sessions.patch', error);
@@ -5317,6 +5344,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
       return {
         modelOverride: modelOverride ?? '',
+        resolvedModelRef: checkSessionModelRoute(normalizedPatch.model ?? '', response).resolvedModelRef,
         ...(patchedThinkingLevel !== undefined ? { thinkingLevel: patchedThinkingLevel } : {}),
       };
     }
@@ -5459,6 +5487,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     return this.activeTurns.has(sessionId) || this.yieldedSessions.has(sessionId);
   }
 
+  getTurnRunIds(sessionId: string): string[] {
+    return [...(this.activeTurns.get(sessionId)?.knownRunIds ?? [])];
+  }
+
   hasActiveSessions(): boolean {
     return this.activeTurns.size > 0 || this.yieldedSessions.size > 0;
   }
@@ -5518,7 +5550,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       );
       return;
     }
-    if (confirmedState && this.isGatewayRpcDegraded()) {
+    if (confirmedState && this.isGatewayRpcDegraded() && !this.store.getSession(sessionId)?.modelPresetId) {
       console.warn(
         '[OpenClawRuntime] skipped redundant sessions.patch before chat.send because gateway session RPCs are degraded.',
         `Session ${sessionId}.`,
@@ -5541,7 +5573,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           );
           return;
         }
-        if (currentConfirmedState && this.isGatewayRpcDegraded()) {
+        if (currentConfirmedState && this.isGatewayRpcDegraded() && !this.store.getSession(sessionId)?.modelPresetId) {
           console.warn(
             '[OpenClawRuntime] skipped queued redundant sessions.patch before chat.send because gateway session RPCs are degraded.',
             `Session ${sessionId}.`,
@@ -5555,12 +5587,20 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         const openClawThinkingLevel = thinkingLevel
           ? resolveOpenClawThinkingLevelForModel(model, thinkingLevel)
           : undefined;
+        const presetId = this.store.getSession(sessionId)?.modelPresetId;
         const response = await this.requestSessionPatchWithProfile({
           sessionId,
           sessionKey,
           patch: {
             model,
-            ...(openClawThinkingLevel ? { thinkingLevel: openClawThinkingLevel } : {}),
+            ...(presetId ? {
+              contextWindow: presetContextWindowSelection(
+                getServerModelMetadata(model.slice(model.indexOf('/') + 1)), presetId,
+              ),
+            } : {}),
+            ...(openClawThinkingLevel
+              ? { thinkingLevel: openClawThinkingLevel }
+              : this.store.getSession(sessionId)?.modelPresetId ? { thinkingLevel: null } : {}),
             ...(isManagedSessionKey(sessionKey)
               ? { reasoningLevel: OpenClawSessionReasoningLevel.Stream }
               : {}),
@@ -5574,7 +5614,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         this.rememberSessionModelPatch(sessionId, sessionKey, model, source);
       });
     } catch (error) {
-      if (error instanceof SessionModelRouteError) {
+      if (error instanceof SessionModelRouteError || this.store.getSession(sessionId)?.modelPresetId) {
         this.sessionModelPatchStateBySession.delete(sessionId);
         throw error;
       }
@@ -5600,6 +5640,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     patchResult: OpenClawSessionPatchGatewayResult | undefined,
   ): void {
     const route = checkSessionModelRoute(requestedModelRef, patchResult);
+    if (this.store.getSession(sessionId)?.modelPresetId && route.resolvedModelRef !== requestedModelRef.trim()) {
+      throw new Error(t('modelPresetModelMismatch'));
+    }
     if (route.verdict === SessionModelRouteVerdict.Ok || !route.resolvedModelRef) return;
     const details = [
       `Session ${sessionId}.`,
@@ -5722,6 +5765,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     this.confirmationModeBySession.set(sessionId, confirmationMode);
 
     let llmTrace: CoworkLlmTrace;
+    let usageModelSelection: CoworkMessageMetadata | undefined;
     if (!options.skipInitialUserMessage) {
       llmTrace = createCoworkLlmTrace();
       const messageSkillIds = options.messageSkillIds ?? options.skillIds;
@@ -5757,14 +5801,16 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       const userMessage = this.store.addMessage(sessionId, {
         type: 'user',
         content: prompt,
-        metadata: { ...metadata, llmTrace },
+        metadata: { ...metadata, ...imageEditMessageMetadata(options.mediaReferences), llmTrace },
       });
+      usageModelSelection = userMessage.metadata;
       this.refreshContinuityCapsule(sessionId, ContinuityCapsuleSource.UserMessage, {
         sourceMessageId: userMessage.id,
       });
       this.emit('message', sessionId, userMessage);
     } else {
       llmTrace = this.ensureLatestUserMessageLlmTrace(session);
+      usageModelSelection = this.store.getLatestUserMessage(sessionId)?.metadata;
     }
 
     const agentId = options.agentId || session.agentId || 'main';
@@ -5788,9 +5834,12 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     this.store.updateSession(sessionId, { status: 'running' });
     this.emitSessionStatus(sessionId, 'running');
-    setCoworkProxySessionId(sessionId);
     firstResponseTiming.gatewayReadyStartedAtMs = Date.now();
     await this.ensureGatewayClientReady();
+    registerLlmUsageContext(llmTrace.traceId, sessionId,
+      options.skipInitialUserMessage ? this.store.getLatestUserMessage(sessionId)?.content ?? prompt : prompt,
+      usageModelSelection);
+
     if (this.cancelTurnStartupIfStopped(sessionId, 'gateway client became ready')) {
       return;
     }
@@ -5816,13 +5865,19 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     if (!session.modelOverride && currentModel && currentModel !== rawCurrentModel && agent?.id) {
       this.store.updateAgent(agent.id, { model: currentModel });
     }
+    const thinkingLevel = session.modelPresetId
+      ? resolveModelThinkingLevelForModel(currentModel, session.thinkingLevel ?? '') ?? ''
+      : session.thinkingLevel || '';
+    if (session.modelPresetId && session.thinkingLevel !== thinkingLevel) {
+      this.store.updateSession(sessionId, { thinkingLevel }, { touchUpdatedAt: false });
+    }
     try {
       firstResponseTiming.modelPatchStartedAtMs = Date.now();
       await this.ensureSessionModelForTurn({
         sessionId,
         sessionKey,
         model: currentModel,
-        thinkingLevel: session.thinkingLevel || undefined,
+        thinkingLevel: thinkingLevel || undefined,
         source: session.modelOverride
           ? SessionModelPatchSource.SessionOverride
           : SessionModelPatchSource.AgentModel,
@@ -6076,7 +6131,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     const sections: string[] = [];
     if (shouldInjectSystemPrompt) {
-      sections.push(this.buildSystemPromptPrefix(normalizedSystemPrompt));
+      sections.push(this.buildSystemPromptPrefix(
+        this.buildInjectedSystemPrompt(normalizedSystemPrompt, agentId),
+      ));
     }
     sections.push(buildOpenClawLocalTimeContextPrompt());
     if (currentModel) {
@@ -6193,8 +6250,24 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       '[LobsterAI system instructions]',
       'Apply the instructions below as the highest-priority guidance for this session.',
       'If earlier LobsterAI system instructions exist, replace them with this version.',
-      systemPrompt,
+      systemPrompt || 'No session-specific instructions apply; follow the workspace instructions in AGENTS.md.',
     ].join('\n');
+  }
+
+  // AGENTS.md is already in the system prompt, so injecting its sections again
+  // only repeats them (issue #2440). Any failure keeps the full prompt.
+  private buildInjectedSystemPrompt(systemPrompt: string, agentId?: string): string {
+    try {
+      return removeWorkspaceDeliveredInstructions({
+        systemPrompt,
+        stateDir: this.engineManager.getStateDir(),
+        agentId,
+        defaultSystemPrompt: this.store.getConfig().systemPrompt,
+      });
+    } catch (error) {
+      console.warn('[OpenClawRuntime] kept the full system prompt because AGENTS.md could not be compared:', error);
+      return systemPrompt;
+    }
   }
 
   private buildBridgePrefix(messages: CoworkMessage[], currentPrompt: string): string {
@@ -7709,6 +7782,20 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
   }
 
+  /**
+   * IM runs are often followed only through lifecycle events, without a local
+   * turn or `complete`. Sync the run's messages first so its user message exists.
+   */
+  private notifyChannelRunEnded(sessionId: string, sessionKey: string, runId: string, runStartedAt?: number): void {
+    const onChannelRunEnded = this.options.onChannelRunEnded;
+    if (!onChannelRunEnded) return;
+    void this.syncSessionHistoryFromGateway(sessionId, sessionKey)
+      .then(() => onChannelRunEnded(sessionId, runId, runStartedAt))
+      .catch((error) => {
+        console.warn('[ChannelSync] failed to sync IM history after a run ended:', error);
+      });
+  }
+
   private handleChannelSessionLifecycleEvent(payload: unknown): void {
     if (!this.channelSessionSync || !isRecord(payload)) return;
 
@@ -7769,6 +7856,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       this.channelLifecycleRunBySessionKey.set(sessionKey, {
         runId,
         observedAtMs: Date.now(),
+        ...(typeof payload.ts === 'number' && Number.isFinite(payload.ts) ? { startedAt: payload.ts } : {}),
       });
       if (activeTurn && runId) {
         activeTurn.knownRunIds.add(runId);
@@ -7815,6 +7903,14 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
     if (isNewlyKnownSession) {
       this.notifySessionsChanged(sessionId);
+    }
+    if (phase !== AgentLifecyclePhase.Start && runId && !activeTurn) {
+      this.notifyChannelRunEnded(
+        sessionId,
+        sessionKey,
+        runId,
+        trackedRun?.runId === runId ? trackedRun.startedAt : undefined,
+      );
     }
     if (phase === AgentLifecyclePhase.Start && runId) {
       this.reportChannelPromptSubmit(sessionId, sessionKey, runId, activeTurn);
@@ -11295,7 +11391,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       if (shouldReplaceLocalConversationWithCronHistory(localEntries, authoritativeEntries, runHistoryKey)) {
         this.store.replaceConversationMessages(
           sessionId,
-          applyLocalTimestampsToEntries(authoritativeEntries, localEntries),
+          applyLocalTurnUsageToEntries(applyLocalTimestampsToEntries(authoritativeEntries, localEntries), localEntries),
         );
         this.channelSyncCursor.set(sessionId, authoritativeEntries.length);
         this.notifySessionsChanged(sessionId);
@@ -11580,7 +11676,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         );
       }
 
-      this.store.replaceConversationMessages(sessionId, applyLocalTimestampsToEntries(entriesToStore, localEntries));
+      this.store.replaceConversationMessages(
+        sessionId,
+        applyLocalTurnUsageToEntries(applyLocalTimestampsToEntries(entriesToStore, localEntries), localEntries),
+      );
       this.channelSyncCursor.set(sessionId, authoritativeEntries.length);
 
       // Notify renderer to refresh
@@ -12274,7 +12373,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       this.refreshContinuityCapsule(sessionId, ContinuityCapsuleSource.PostRun);
     }
     this.activeTurns.delete(sessionId);
-    setCoworkProxySessionId(null);
     if (completedNormally && !turn?.yieldedRunId) {
       setTimeout(() => this.startPendingGoalContinuation(sessionId), 0);
     } else if (!completedNormally && !this.yieldedSessions.has(sessionId)) {
@@ -12618,7 +12716,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         conversationState,
         isMainAgent: agentId === 'main',
         platform: channel.platform,
-      });
+      }, sessionId);
     } catch (error) {
       const errorName = error instanceof Error && error.name.trim()
         ? error.name.trim()

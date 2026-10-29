@@ -14,6 +14,7 @@ import {
   isValidLlmTraceId,
   LLM_TRACEPARENT_HEADER,
   LOBSTER_SERVER_TRACE_ID_HEADER,
+  NATIVE_RUN_LLM_TRACE_PROXY_PATH,
   parseLlmTraceparent,
 } from '../../shared/cowork/llmTurnUsage';
 import { EnterpriseApiErrorCode } from '../../shared/enterpriseAccount/constants';
@@ -24,7 +25,24 @@ import {
 } from '../../shared/providers/modelRuntimeProfiles';
 import type { EnterpriseAuthSessionSnapshot } from '../enterpriseAccount/membershipRevocation';
 import { createLlmSpanId, createLlmTraceId } from './llmTrace';
+import { clearLlmUsageContexts, getLlmUsageHeaders, LlmUsageHeader } from './llmUsageContext';
 import { listenOnLoopback } from './loopbackListen';
+import {
+  clearNativeRunTurnUsage,
+  type NativeRunLlmTraceReport,
+  recordNativeRunLlmTrace,
+} from './nativeRunTurnUsage';
+import {
+  extractPromptUsage,
+  fingerprintPromptRequest,
+  formatPromptPrefixObservation,
+  isRoutinePromptPrefixObservation,
+  mergePromptUsage,
+  type PromptPrefixObservation,
+  PromptPrefixTracker,
+  type PromptUsage,
+  resolvePromptAnchorKey,
+} from './promptPrefixDiagnostics';
 
 const PROXY_BIND_HOST = '127.0.0.1';
 // Header names OpenAI-, Anthropic- and Google-style clients use for the provider key.
@@ -39,11 +57,14 @@ const PROXY_UPSTREAM_ERROR_MESSAGE = 'Token proxy upstream error';
 const PROXY_UPSTREAM_NETWORK_ERROR_TYPE = 'upstream_network_error';
 // Electron net.fetch rejects with Chromium's net error name, e.g. "net::ERR_HTTP2_PING_FAILED".
 const CHROMIUM_NET_ERROR_PATTERN = /\bnet::(ERR_[A-Z0-9_]+)\b/;
+// Chat-style model requests whose prompt prefix is compared for cache diagnostics.
+const PROMPT_PREFIX_PATH_PATTERN = /\/(chat\/completions|messages)$/;
 
 let proxyServer: http.Server | null = null;
 let proxyPort: number | null = null;
 let recentQuotaError: OpenClawTokenProxyQuotaError | null = null;
 const traceStatsById = new Map<string, OpenClawTokenProxyTraceStats>();
+const promptPrefixTracker = new PromptPrefixTracker();
 
 // Injected dependencies
 let tokenGetter: (() => { accessToken: string; refreshToken: string } | null) | null = null;
@@ -113,6 +134,9 @@ type ProxyRequestTrace = {
   serverTraceId: string | null;
   status: number | null;
   finished: boolean;
+  /** Prompt prefix compared with the previous request of the same conversation. */
+  promptPrefix?: { key: string; observation: PromptPrefixObservation };
+  promptUsage?: PromptUsage;
 };
 
 const ProxyRequestOutcome = {
@@ -174,6 +198,9 @@ export function stopOpenClawTokenProxy(): void {
   proxyPort = null;
   recentQuotaError = null;
   traceStatsById.clear();
+  promptPrefixTracker.clear();
+  clearLlmUsageContexts();
+  clearNativeRunTurnUsage();
   tokenGetter = null;
   tokenRefresher = null;
   serverBaseUrlGetter = null;
@@ -265,6 +292,55 @@ function finishProxyRequest(
   } else {
     console.warn(message);
   }
+  logPromptPrefixObservation(trace);
+}
+
+function parseJsonBody(body: Buffer): unknown {
+  try {
+    return JSON.parse(body.toString('utf8')) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Fingerprints a chat request and compares it with the conversation's previous request. Log-only. */
+function observePromptPrefix(trace: ProxyRequestTrace, body: unknown, bodyBytes: number, requestModel: unknown): void {
+  if (!PROMPT_PREFIX_PATH_PATTERN.test(trace.path)) return;
+  try {
+    const fingerprint = fingerprintPromptRequest(body, bodyBytes);
+    if (!fingerprint) return;
+    const sessionId = getLlmUsageHeaders(trace.traceparent, requestModel, sessionKeyGetter?.())[LlmUsageHeader.Session];
+    // Native runs (IM, cron, heartbeat) carry no Cowork session id; their first message anchors them.
+    const key = sessionId ? `session:${sessionId}` : `anchor:${resolvePromptAnchorKey(fingerprint)}`;
+    trace.promptPrefix = {
+      key,
+      observation: promptPrefixTracker.observe(key, trace.traceId, fingerprint, trace.startedAt),
+    };
+  } catch (error) {
+    console.debug('[OpenClawTokenProxy] prompt prefix diagnostic skipped:', error);
+  }
+}
+
+function recordPromptUsageFromPayload(trace: ProxyRequestTrace | undefined, payload: string): void {
+  if (!trace?.promptPrefix || !payload.includes('"usage"')) return;
+  try {
+    const usage = extractPromptUsage(JSON.parse(payload) as unknown);
+    if (usage) trace.promptUsage = mergePromptUsage(trace.promptUsage, usage);
+  } catch {
+    // Non-JSON packets carry no usage.
+  }
+}
+
+function logPromptPrefixObservation(trace: ProxyRequestTrace): void {
+  if (!trace.promptPrefix) return;
+  const { key, observation } = trace.promptPrefix;
+  const message = `[OpenClawTokenProxy] prompt prefix trace=${trace.traceId} span=${trace.spanId} key=${key} `
+    + formatPromptPrefixObservation(observation, trace.promptUsage);
+  if (isRoutinePromptPrefixObservation(observation)) {
+    console.debug(message);
+  } else {
+    console.log(message);
+  }
 }
 
 export function consumeRecentOpenClawTokenProxyQuotaError(
@@ -288,6 +364,30 @@ function collectRequestBody(req: http.IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** Records an IM/cron run's trace; it is answered locally and never forwarded. */
+async function handleNativeRunLlmTraceReport(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  let report: NativeRunLlmTraceReport | null = null;
+  try {
+    const parsed: unknown = JSON.parse((await collectRequestBody(req)).toString('utf8'));
+    report = parsed && typeof parsed === 'object' ? parsed as NativeRunLlmTraceReport : null;
+  } catch {
+    report = null;
+  }
+  if (!report) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid native run trace report' }));
+    return;
+  }
+  if (recordNativeRunLlmTrace(report, Date.now(), sessionKeyGetter?.() ?? undefined)) {
+    console.debug(
+      `[OpenClawTokenProxy] native run ${String(report.runId)} uses trace=${String(report.traceId)}`
+      + ` model=${String(report.model ?? 'unknown')} virtualModel=${String(report.virtualModelId ?? 'none')}`,
+    );
+  }
+  res.writeHead(204);
+  res.end();
 }
 
 function shouldRefreshLobsterAIToken(status: number): boolean {
@@ -390,6 +490,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     rejectInboundRequest(req, res, 401, 'invalid_proxy_token');
     return;
   }
+  if (req.method === 'POST' && (req.url ?? '').split('?')[0] === NATIVE_RUN_LLM_TRACE_PROXY_PATH) {
+    await handleNativeRunLlmTraceReport(req, res);
+    return;
+  }
   let requestTrace: ProxyRequestTrace | undefined;
   try {
     const tokens = tokenGetter?.();
@@ -412,13 +516,19 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const body = await collectRequestBody(req);
     requestTrace = createProxyRequestTrace(req.headers[LLM_TRACEPARENT_HEADER], req.url?.split('?')[0] ?? '/');
     recordProxyRequestStarted(requestTrace, body.length);
+    const parsedBody = parseJsonBody(body);
+    // Invalid/non-JSON bodies are forwarded unchanged and receive no mode label.
+    const requestModel = isRecord(parsedBody) ? parsedBody.model : undefined;
+    observePromptPrefix(requestTrace, parsedBody, body.length, requestModel);
     const upstreamBody = shouldHydrateGeminiChatCompletionsBody(req.url)
       ? hydrateGeminiChatCompletionsBody(body)
       : body;
 
     // Build upstream URL: serverBaseUrl + request path
     // OpenClaw sends to /v1/chat/completions, upstream is /api/proxy/v1/chat/completions
-    const upstreamPath = `/api/proxy${req.url || '/'}`;
+    // Only the two virtual-model resolution routes share this authenticated loopback transport.
+    const resolutionPath = /^\/models\/(yd-fast|yd-ultra)\/resolve$/.test(req.url ?? '');
+    const upstreamPath = resolutionPath ? `/api${req.url}` : `/api/proxy${req.url || '/'}`;
     const upstreamUrl = `${serverBaseUrl}${upstreamPath}`;
 
     const clientVersion = clientVersionGetter?.() ?? '';
@@ -430,6 +540,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       req.headers,
       clientVersion,
       requestTrace.traceparent,
+      requestModel,
     );
     if (!isProxySessionKeyCurrent(requestSessionKey, sessionKeyGetter)) {
       cancelUpstreamResult(result);
@@ -449,6 +560,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           req.headers,
           clientVersion,
           requestTrace.traceparent,
+          requestModel,
         );
         if (!isProxySessionKeyCurrent(requestSessionKey, sessionKeyGetter)) {
           cancelUpstreamResult(result);
@@ -478,6 +590,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           req.headers,
           clientVersion,
           requestTrace.traceparent,
+          requestModel,
         );
         if (!isProxySessionKeyCurrent(requestSessionKey, sessionKeyGetter)) {
           cancelUpstreamResult(retryResult);
@@ -975,6 +1088,7 @@ function inspectProxySSEPacket(
   if (parsed.event || parsed.payload) {
     scanState.eventCount += 1;
   }
+  recordPromptUsageFromPayload(scanState.requestTrace, parsed.payload);
   const terminalKind = classifyTerminalProxySSEPacket(parsed);
   if (terminalKind) {
     recordProxySSETerminalKind(scanState, terminalKind);
@@ -1046,6 +1160,7 @@ async function forwardRequest(
   incomingHeaders: http.IncomingHttpHeaders,
   clientVersion: string,
   traceparent: string,
+  requestModel: unknown,
 ): Promise<UpstreamResult> {
   let accountContextHeaders: Record<string, string> = {};
   try {
@@ -1059,6 +1174,7 @@ async function forwardRequest(
     clientVersion,
     accountContextHeaders,
     traceparent,
+    requestModel,
   );
 
   const resp = await net.fetch(url, {
@@ -1099,6 +1215,7 @@ function buildUpstreamRequestHeaders(
   clientVersion: string,
   accountContextHeaders: Record<string, string> = {},
   traceparent?: string,
+  requestModel?: unknown,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     ...accountContextHeaders,
@@ -1107,6 +1224,7 @@ function buildUpstreamRequestHeaders(
     [LOBSTERAI_CLIENT_CAPABILITIES_HEADER]: LOBSTERAI_CLIENT_CAPABILITIES,
     [LOBSTERAI_CLIENT_VERSION_HEADER]: clientVersion,
     ...(traceparent ? { [LLM_TRACEPARENT_HEADER]: traceparent } : {}),
+    ...getLlmUsageHeaders(traceparent, requestModel, sessionKeyGetter?.()),
   };
 
   // Forward accept header for SSE streaming
@@ -1133,6 +1251,7 @@ function pipeResponse(
     pipeStreamingResponseWithQuotaScan(result.body, res, inspectionContext, requestTrace);
   } else if (Buffer.isBuffer(result.body)) {
     scanProxyBodyForQuotaError(result.body, Date.now(), inspectionContext);
+    recordPromptUsageFromPayload(requestTrace, result.body.toString('utf8'));
     res.end(result.body);
     finishProxyRequest(
       requestTrace,

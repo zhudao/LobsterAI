@@ -42,6 +42,7 @@ import {
   type CoworkSelectedTextValidationError,
   normalizeCoworkSelectedTextSnippets,
 } from '../../../shared/cowork/selectedText';
+import { isChatPresetSession } from '../../../shared/modelPresets/constants';
 import { classifyWaitingNotificationKind, WaitingNotificationKind } from '../../../shared/notifications/constants';
 import { ShareDeploymentCandidateSource } from '../../../shared/shareDeployment/constants';
 import { resolveArtifactAutoPreviewEnabled } from '../../config';
@@ -154,6 +155,7 @@ import { MarkdownLinkOpenerContext } from '../markdownLinkOpener';
 import { type ToastEventDetail } from '../Toast';
 import { resolveAgentModelSelection, useAgentSelectedModel } from './agentModelSelection';
 import ArtifactPreviewTabItem from './ArtifactPreviewTabItem';
+import { type ArtifactTabActionTarget, artifactTabMenuActions } from './artifactTabActions';
 import AssistantTurnBlock, { ContextCompactionDivider } from './AssistantTurnBlock';
 import type { BrowserAnnotationAttachmentOpenPayload } from './BrowserAnnotationMessageAttachments';
 import { type CoworkOpenShareOptionsEventDetail, CoworkUiEvent } from './constants';
@@ -191,6 +193,7 @@ import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInpu
 import QuestionDock from './interactions/QuestionDock';
 import { isQuestionDockRequest } from './interactions/questionDockModel';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
+import { buildMediaTaskPresentations } from './mediaTaskPresentation';
 import {
   buildConversationTurns,
   buildDisplayItems,
@@ -229,6 +232,7 @@ interface CoworkSessionDetailProps {
     selectedTextSnippets?: CoworkSelectedTextSnippet[],
     browserAnnotations?: import('@shared/cowork/browserAnnotations').CoworkBrowserAnnotationMessageBatch[],
     collaborationMode?: CoworkCollaborationModeType,
+    titleInput?: string,
   ) => boolean | void | Promise<boolean | void>;
   onStop: () => void;
   isSidebarCollapsed?: boolean;
@@ -1404,6 +1408,16 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const isMac = window.electron.platform === 'darwin';
   const isWindows = window.electron.platform === 'win32';
   const currentSession = useSelector(selectCurrentSession);
+  const [modelSwitchNotice, setModelSwitchNotice] = useState<{ sessionId: string; messageId: string } | null>(null);
+  useEffect(() => {
+    if (!modelSwitchNotice) return;
+    if (modelSwitchNotice.sessionId !== currentSession?.id) {
+      setModelSwitchNotice(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setModelSwitchNotice(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [modelSwitchNotice, currentSession?.id]);
   const pendingPermissions = useSelector(selectPendingPermissions);
   const enterpriseAccountContext = useSelector(selectEnterpriseAccountContext);
   const isStreaming = useSelector(selectIsStreaming);
@@ -1423,6 +1437,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const currentAgentSelectedModel = useAgentSelectedModel(
     currentAgentId,
     currentAgent?.model ?? '',
+    !currentSession || isChatPresetSession(currentSession),
   );
   const selectedDraftSnippets = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.draftSelectedTextSnippets[currentSession.id] ?? [] : []
@@ -3541,6 +3556,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       && !isBrowserPreviewTabOpen
       && !isAgentBrowserPreviewTabOpen
       && !isSubagentPreviewTabOpen
+      && !isUserAttachmentPreviewTabOpen
     ) {
       dispatch(closePanel({ sessionId }));
     }
@@ -3551,8 +3567,25 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     isBrowserPreviewTabOpen,
     isFileListPreviewTabOpen,
     isSubagentPreviewTabOpen,
+    isUserAttachmentPreviewTabOpen,
     sessionId,
   ]);
+
+  const artifactTabActionTargets: ArtifactTabActionTarget[] = [
+    ...([
+      [ArtifactSpecialTab.FileList, isFileListPreviewTabOpen, handleActivateArtifactFileListTab, handleCloseArtifactFileListTab],
+      [ArtifactSpecialTab.Browser, isBrowserPreviewTabOpen, handleActivateArtifactBrowserTab, handleCloseArtifactBrowserTab],
+      [ArtifactSpecialTab.AgentBrowser, isAgentBrowserPreviewTabOpen, handleActivateArtifactAgentBrowserTab, handleCloseArtifactAgentBrowserTab],
+      [ArtifactSpecialTab.Subagents, isSubagentPreviewTabOpen, handleActivateArtifactSubagentTab, handleCloseArtifactSubagentTab],
+      [ArtifactSpecialTab.UserAttachment, isUserAttachmentPreviewTabOpen, handleActivateArtifactUserAttachmentTab, handleCloseArtifactUserAttachmentTab],
+    ] as const).filter(([, open]) => open).map(([id, , activate, close]) => ({
+      id, active: !activeArtifactPreviewTab && activeSpecialPreviewTab === id, activate, close,
+    })),
+    ...artifactTabsWithArtifacts.map(({ tab }) => ({
+      id: tab.id, active: tab.id === activeArtifactPreviewTab?.id,
+      activate: () => handleActivateArtifactTab(tab.id), close: () => handleCloseArtifactTab(tab.id),
+    })),
+  ];
 
   const handleToggleArtifactPanel = useCallback(() => {
     reportArtifactPreviewAction({
@@ -5139,12 +5172,14 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     () => buildConversationTurns(displayItems, { leadingTurnStartTimestamp, leadingTurnUsage }),
     [displayItems, leadingTurnStartTimestamp, leadingTurnUsage],
   );
+  const mediaTaskPresentations = useMemo(() => buildMediaTaskPresentations(turns), [turns]);
   const enterpriseQuotaSignal = useMemo(
     () => findCurrentEnterpriseQuotaSignal(currentSession, currentMessagesWithDetachedTail),
     [currentMessagesWithDetachedTail, currentSession],
   );
   const sessionModelSelection = useMemo(() => resolveAgentModelSelection({
     sessionModel: currentSession?.modelOverride,
+    sessionPresetId: currentSession?.modelPresetId,
     agentModel: currentAgent?.model ?? '',
     availableModels,
     fallbackModel: currentAgentSelectedModel,
@@ -5155,6 +5190,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     currentAgent?.model,
     currentAgentSelectedModel,
     currentSession?.modelOverride,
+    currentSession?.modelPresetId,
   ]);
   const activeEnterpriseQuotaSignal = useMemo(
     () => resolveActiveEnterpriseQuotaSignal(
@@ -6068,6 +6104,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             >
               <AssistantTurnBlock
                 turn={turn}
+                mediaTaskPresentations={mediaTaskPresentations}
                 artifacts={turnArtifacts}
                 resolveLocalFilePath={resolveLocalFilePath}
                 mapDisplayText={mapDisplayText}
@@ -6093,6 +6130,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 awaitingRunStart={isAwaitingRunStart}
                 showCopyButtons={!isStreaming || !isLastTurn}
                 hiddenSystemMessageId={enterpriseQuotaPromptMessageId}
+                modelSwitchNoticeMessageId={
+                  !isExportingImage && modelSwitchNotice?.sessionId === currentSession.id
+                    ? modelSwitchNotice.messageId
+                    : null
+                }
+                onDismissModelSwitchNotice={() => setModelSwitchNotice(null)}
                 completedGoal={
                   isLastTurn && currentSession.goal?.status === CoworkGoalStatus.Complete
                     ? currentSession.goal
@@ -6195,6 +6238,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       closeLabel={i18nService.t('artifactCloseTab')}
                       onActivate={handleActivateArtifactFileListTab}
                       onClose={handleCloseArtifactFileListTab}
+                      {...artifactTabMenuActions(artifactTabActionTargets, ArtifactSpecialTab.FileList)}
                     />
                   )}
                   {isBrowserPreviewTabOpen && (
@@ -6205,6 +6249,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       closeLabel={i18nService.t('artifactCloseTab')}
                       onActivate={handleActivateArtifactBrowserTab}
                       onClose={handleCloseArtifactBrowserTab}
+                      {...artifactTabMenuActions(artifactTabActionTargets, ArtifactSpecialTab.Browser)}
                     />
                   )}
                   {isAgentBrowserPreviewTabOpen && (
@@ -6221,6 +6266,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       ) : undefined}
                       onActivate={handleActivateArtifactAgentBrowserTab}
                       onClose={handleCloseArtifactAgentBrowserTab}
+                      {...artifactTabMenuActions(artifactTabActionTargets, ArtifactSpecialTab.AgentBrowser)}
                     />
                   )}
                   {isSubagentPreviewTabOpen && (
@@ -6231,6 +6277,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       closeLabel={i18nService.t('artifactCloseTab')}
                       onActivate={handleActivateArtifactSubagentTab}
                       onClose={handleCloseArtifactSubagentTab}
+                      {...artifactTabMenuActions(artifactTabActionTargets, ArtifactSpecialTab.Subagents)}
                     />
                   )}
                   {isUserAttachmentPreviewTabOpen && (
@@ -6241,6 +6288,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                       closeLabel={i18nService.t('artifactCloseTab')}
                       onActivate={handleActivateArtifactUserAttachmentTab}
                       onClose={handleCloseArtifactUserAttachmentTab}
+                      {...artifactTabMenuActions(artifactTabActionTargets, ArtifactSpecialTab.UserAttachment)}
                     />
                   )}
                   {artifactTabsWithArtifacts.map(({ tab, artifact }) => {
@@ -6254,6 +6302,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                         closeLabel={i18nService.t('artifactCloseTab')}
                         onActivate={() => handleActivateArtifactTab(tab.id)}
                         onClose={() => handleCloseArtifactTab(tab.id)}
+                        {...artifactTabMenuActions(artifactTabActionTargets, tab.id)}
                       />
                     );
                   })}
@@ -6939,6 +6988,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             onManageSkills={remoteManaged ? undefined : onManageSkills}
             onManageKits={remoteManaged ? undefined : onManageKits}
             showModelSelector={true}
+            onModelSwitch={(noticeSessionId, messageId) => setModelSwitchNotice({ sessionId: noticeSessionId, messageId })}
             showReadOnlyContext={!isArtifactPanelExpanded}
             showNewUserWelcomeLoginOverlay={isNewUserWelcomeSession}
             readOnlyContextTrailingText={isArtifactPanelExpanded ? undefined : i18nService.t('aiGeneratedDisclaimer')}
